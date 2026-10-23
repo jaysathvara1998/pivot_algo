@@ -1,0 +1,11 @@
+paper/FEED_*.json
+paper/LIVE_*.json
+paper/logs/
+paper/live/
+paper/_bt_tmp/
+paper/live_dryrun/
+logs/
+datasets/raw/dhan/scrip/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,13 @@
+[Unit]
+Description=Pivot brain dashboard (local only; reach it over an SSH tunnel: ssh -L 8765:127.0.0.1:8765 user@server)
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/pivot_brain
+ExecStart=/usr/bin/python3 tools/dashboard.py --port 8765
+Restart=always
+User=trader
+Environment=TZ=Asia/Kolkata
+
+[Install]
+WantedBy=multi-user.target

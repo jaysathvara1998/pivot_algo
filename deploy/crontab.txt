@@ -1,0 +1,6 @@
+# crontab -e on the server (times in IST; set the server timezone to Asia/Kolkata or convert). Mon–Fri only; holidays are harmless (no bars → no trades).
+30 8  * * 1-5  cd /opt/pivot_brain && python3 tools/dhan_token.py auto >> logs/token.log 2>&1
+0  9  * * 1-5  cd /opt/pivot_brain && LIVE=0 sh deploy/run_session.sh >> logs/cron.log 2>&1
+40 15 * * 1-5  cd /opt/pivot_brain && sh deploy/stop_session.sh >> logs/cron.log 2>&1
+45 15 * * 1-5  cd /opt/pivot_brain && python3 tools/fetch_recent.py >> logs/data.log 2>&1
+30 20 * * *    cd /opt/pivot_brain && python3 tools/dhan_token.py auto >> logs/token.log 2>&1
