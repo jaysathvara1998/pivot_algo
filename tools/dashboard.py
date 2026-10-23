@@ -2,7 +2,7 @@
 """Local control dashboard for the TradingAlgo knowledge base (stdlib only; binds to 127.0.0.1 only; nothing is published).
   python3 tools/dashboard.py [--port 8765]   → open http://127.0.0.1:8765
 Panels: status (token, data, paper trader), token (verify / auto-renew / save pasted token / TOTP credentials / launchd), data (fetch new sessions), backtests (run a brain backtest over any
-window with any variant; list and view reports), paper trading (start / stop the two-brain trader with options, live log, today's trades), Telegram (setup / test), catalogue comparison."""
+window with any variant; list and view reports), paper trading (start / stop the two-brain trader with options, live log, today's trades), Telegram (setup / test), catalogue comparison, resources (CPU/RAM of the algo processes and the machine; /api/resources)."""
 from __future__ import annotations
 
 import argparse, csv, json, os, re, signal, subprocess, sys, threading, time, urllib.parse
@@ -118,6 +118,100 @@ def paper_status():
     trades = list(csv.DictReader(open(PAPER / f"TRADES_{d}.csv"))) if (PAPER / f"TRADES_{d}.csv").exists() else []
     running = bool(paper_pids()); feed_running = subprocess.run(["pgrep", "-f", "tools/dhan_feed.py"], capture_output=True).returncode == 0
     return {"date": d, "running": running, "pids": paper_pids(), "feed_running": feed_running, "state": st, "trades": trades, "log": tail(LOGS / f"paper_{d}.log", 40), "sessions": sorted(p.name for p in PAPER.glob("SESSION_*.md"))[-15:]}
+
+
+RES = {"cur": None, "hist": [], "prev": {}, "lock": threading.Lock()}
+IS_LINUX = sys.platform.startswith("linux"); CLK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _algo_procs():
+    """(name, pid) of every process that belongs to the algo: this dashboard, the feed, the paper/live traders and running background jobs."""
+    out = [("dashboard", os.getpid())] + [("feed", p) for p in _pids("tools/dhan_feed.py")] + [("paper", p) for p in paper_pids()] + [("live", p) for p in live_pids()]
+    with LOCK:
+        out += [(f"job:{n}", j["pid"]) for n, j in JOBS.items() if j["proc"].poll() is None]
+    seen = set(); return [(n, p) for n, p in out if not (p in seen or seen.add(p))]
+
+
+def _sys_sample():
+    """Returns (cpu_ticks (total, idle) or None, (mem_total_mb, mem_avail_mb), temp_c or None)."""
+    if IS_LINUX:
+        v = [int(x) for x in open("/proc/stat").readline().split()[1:]]; cpu = (sum(v), v[3] + (v[4] if len(v) > 4 else 0))
+        mi = {}
+        for ln in open("/proc/meminfo"):
+            k, _, rest = ln.partition(":"); mi[k] = int(rest.split()[0]) if rest.split() else 0
+        temp = None
+        try:
+            temp = int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000      # Raspberry Pi / most SBCs
+        except Exception:
+            pass
+        return cpu, (mi["MemTotal"] / 1024, mi.get("MemAvailable", mi.get("MemFree", 0)) / 1024), temp
+    total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout or 0) / 1048576       # macOS
+    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout; m = re.search(r"page size of (\d+)", vm); page = int(m.group(1)) if m else 16384
+    pg = lambda k: int((re.search(rf"{k}:\s+(\d+)", vm) or [None, "0"])[1])
+    return None, (total, (pg("Pages free") + pg("Pages inactive") + pg("Pages speculative")) * page / 1048576), None
+
+
+def _res_sample():
+    """One sample of system CPU/RAM and of each algo process; keeps 15 minutes of history (5 s steps). CPU% is instantaneous on Linux (delta of /proc counters), ps's recent average on macOS."""
+    now = time.time(); cpu, (mt, ma), temp = _sys_sample(); prev = RES["prev"]; ncpu = os.cpu_count() or 1
+    if cpu:
+        pc = prev.get("sys"); prev["sys"] = cpu
+        sys_pct = (max(0.0, (cpu[0] - pc[0] - (cpu[1] - pc[1])) / (cpu[0] - pc[0]) * 100) if pc and cpu[0] > pc[0] else None)
+    else:
+        sys_pct = sum(float(x) for x in subprocess.run(["ps", "-A", "-o", "%cpu="], capture_output=True, text=True).stdout.split()) / ncpu
+    procs = _algo_procs(); rows = []
+    if procs:
+        out = subprocess.run(["ps", "-o", "pid=,rss=,etime=,%cpu=", "-p", ",".join(str(p) for _, p in procs)], capture_output=True, text=True).stdout; by = {}
+        for ln in out.splitlines():
+            f = ln.split()
+            if len(f) >= 4:
+                by[int(f[0])] = {"rss_mb": int(f[1]) / 1024, "elapsed": f[2], "cpu_pct": float(f[3])}
+        for n, pid in procs:
+            r = by.get(pid)
+            if not r:
+                continue
+            if IS_LINUX:
+                try:
+                    st = open(f"/proc/{pid}/stat").read().rpartition(")")[2].split(); t = (int(st[11]) + int(st[12])) / CLK; pt = prev.get(pid)
+                    if pt and now > pt[1]:
+                        r["cpu_pct"] = max(0.0, (t - pt[0]) / (now - pt[1]) * 100)
+                    prev[pid] = (t, now)
+                except Exception:
+                    pass
+            rows.append({"name": n, "pid": pid, "cpu_pct": round(r["cpu_pct"], 1), "rss_mb": round(r["rss_mb"], 1), "elapsed": r["elapsed"]})
+    live = {p for _, p in procs}
+    for k in [k for k in prev if isinstance(k, int) and k not in live]:
+        prev.pop(k)
+    algo_cpu = round(sum(r["cpu_pct"] for r in rows), 1); algo_rss = round(sum(r["rss_mb"] for r in rows), 1)
+    try:
+        load = [round(x, 2) for x in os.getloadavg()]
+    except Exception:
+        load = None
+    cur = {"t": now, "sys_cpu": None if sys_pct is None else round(sys_pct, 1), "ncpu": ncpu, "load": load, "mem_total_mb": round(mt), "mem_used_mb": round(mt - ma), "temp_c": temp, "algo_cpu": algo_cpu, "algo_rss_mb": algo_rss, "procs": rows, "platform": "linux" if IS_LINUX else sys.platform}
+    with RES["lock"]:
+        RES["cur"] = cur; RES["hist"].append([int(now), cur["sys_cpu"], algo_cpu, round(algo_rss)]); del RES["hist"][:-180]
+
+
+def _res_loop():
+    while True:
+        try:
+            _res_sample()
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+def resources():
+    with RES["lock"]:
+        cur = RES["cur"]; hist = list(RES["hist"])
+    if cur is None:
+        try:
+            _res_sample(); time.sleep(0.5); _res_sample()
+        except Exception as e:
+            return {"error": str(e)[:200]}
+        with RES["lock"]:
+            cur = RES["cur"]; hist = list(RES["hist"])
+    return {**cur, "hist": hist}
 
 
 CHART_CACHE = {"t": 0, "data": None}
@@ -258,6 +352,9 @@ pre{background:#0a0e13;border:1px solid var(--line);border-radius:10px;padding:1
 section{display:none}section.on{display:block}.spin{display:inline-block;width:12px;height:12px;border:2px solid #fff;border-right-color:transparent;border-radius:50%;animation:s .7s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
 .badge{font-size:11px;padding:2px 7px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
 .result-line{font-size:12.5px}.result-line b{color:#fff}
+.meter{height:6px;background:var(--line);border-radius:3px;margin-top:6px;overflow:hidden}.meter i{display:block;height:100%;background:var(--accent);border-radius:3px;transition:width .4s}.meter i.warn{background:var(--warn)}.meter i.bad{background:var(--bad)}
+.rgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px}@media(max-width:1100px){.rgrid{grid-template-columns:1fr 1fr}}.rtile{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}.rtile .l{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}.rtile .v{font-size:20px;font-weight:600;margin-top:2px}.rtile .d{font-size:11px;color:var(--muted)}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin:6px 0 2px}.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
 </style></head><body>
 <div class="app"><aside>
 <div class="brand"><div class="dot"></div><div><b>TradingAlgo</b><small>local console · NIFTY</small></div></div>
@@ -275,6 +372,7 @@ section{display:none}section.on{display:block}.spin{display:inline-block;width:1
 <div class="step"><h4><span class="n">3</span>During the day</h4><p>Watch the live log or your Telegram. Do not change settings mid-session; a bad day under fixed rules is data.</p><button class="btn sm ghost" onclick="go('paper')">View live log</button></div>
 <div class="step"><h4><span class="n">4</span>After 15:30</h4><p>Read the session report. The 20:30 agent fetches the day's data; backfill wings if you want to backtest that day.</p><button class="btn sm ghost" onclick="go('backtest')">Open Backtests</button></div>
 </div></div>
+<div class="card"><h3>Resources <span class="tag">CPU and RAM used by the algo processes · updated every 30 s, sampled every 5 s</span></h3><div class="rgrid" id="rtiles"></div><div class="legend"><span><i style="background:#3b82f6"></i>algo processes (sum, % of one core)</span><span><i style="background:#d97706"></i>whole machine (% of all cores)</span><span id="rspan" style="margin-left:auto"></span></div><canvas id="rchart" style="width:100%;height:120px;display:block"></canvas><div id="rprocs" style="margin-top:10px"></div></div>
 <div class="grid g2"><div class="card"><h3>System health</h3><div id="health"></div></div><div class="card"><h3>Recent activity <span class="tag">token log</span></h3><pre id="tokenlog" style="max-height:220px"></pre></div></div>
 </section>
 
@@ -285,7 +383,7 @@ section{display:none}section.on{display:block}.spin{display:inline-block;width:1
 <div class="card"><h3>Save a token generated on web.dhan.co</h3><p class="muted" style="margin:0 0 8px">My Profile → Access DhanHQ APIs → Generate. Paste it below; it is stored in ~/.dhan with owner-only permissions and verified immediately.</p>
 <div class="row"><input id="tokpaste" type="password" placeholder="paste access token" style="flex:1;min-width:300px"><button class="btn" onclick="postAct('/api/token/save',{token:v('tokpaste')},'Saving token…')">Save token</button></div></div></div>
 <div class="card"><h3>TOTP credentials <span class="tag">one-time, enables automatic generation</span></h3><p class="muted" style="margin:0 0 8px">On web.dhan.co enable TOTP under Access DhanHQ APIs and copy the base32 secret. Fields are masked and never echoed back.</p>
-<div class="row"><label class="f">Client ID<input id="cid" placeholder="1113788351"></label><label class="f">PIN<input id="pin" type="password"></label><label class="f">TOTP secret<input id="totp" type="password" style="min-width:280px"></label><button class="btn" style="align-self:flex-end" onclick="postAct('/api/token/credentials',{cid:v('cid'),pin:v('pin'),totp:v('totp')},'Saving credentials…')">Save credentials</button></div></div>
+<div class="row"><label class="f">Client ID<input id="cid" placeholder="Dhan client ID"></label><label class="f">PIN<input id="pin" type="password"></label><label class="f">TOTP secret<input id="totp" type="password" style="min-width:280px"></label><button class="btn" style="align-self:flex-end" onclick="postAct('/api/token/credentials',{cid:v('cid'),pin:v('pin'),totp:v('totp')},'Saving credentials…')">Save credentials</button></div></div>
 <div class="card"><h3>Output</h3><pre id="tokout" class="mono">—</pre></div>
 </section>
 
@@ -361,7 +459,8 @@ function go(t){TABS.forEach(x=>{el(x[0]).classList.toggle('on',x[0]===t);el('nb_
 function inr(x){return '₹'+Math.round(x).toLocaleString('en-IN')}
 async function refreshAll(){let s;try{s=await api('/api/status')}catch(e){toast('Dashboard server not reachable','bad');return}
 const tk=s.token,pp=s.paper,dj=s.jobs;
-el('toppills').innerHTML=`<span class="pill ${tk.valid?'ok':'bad'}">● token ${tk.valid?'valid'+(tk.hours_left!=null?' · '+tk.hours_left+' h':''):'INVALID'}</span><span class="pill ${pp.running?'ok':'muted'}">● paper ${pp.running?'running':'idle'}</span><span class="pill ${pp.feed_running?'ok':'muted'}">● feed ${pp.feed_running?'live':'off'}</span><span class="pill ${dj.some(j=>j.running)?'warn':'muted'}">● ${dj.filter(j=>j.running).length} jobs</span>`;
+el('toppills').innerHTML=`<span class="pill ${tk.valid?'ok':'bad'}">● token ${tk.valid?'valid'+(tk.hours_left!=null?' · '+tk.hours_left+' h':''):'INVALID'}</span><span class="pill ${pp.running?'ok':'muted'}">● paper ${pp.running?'running':'idle'}</span><span class="pill ${pp.feed_running?'ok':'muted'}">● feed ${pp.feed_running?'live':'off'}</span><span class="pill ${dj.some(j=>j.running)?'warn':'muted'}">● ${dj.filter(j=>j.running).length} jobs</span>${s.res&&!s.res.error?`<span class="pill ${s.res.algo_cpu>=150?'bad':s.res.algo_cpu>=80?'warn':'muted'}" title="CPU and RAM of all algo processes">● algo cpu ${s.res.algo_cpu.toFixed(0)}% · ram ${Math.round(s.res.algo_rss_mb)} MB</span>`:''}`;
+const rp=pid=>{const q=((s.res&&s.res.procs)||[]).find(x=>x.pid===pid);return q?{cpu:q.cpu_pct.toFixed(1)+'%',ram:Math.round(q.rss_mb)+' MB'}:{cpu:'—',ram:'—'}};drawRes(s.res);
 el('kpis').innerHTML=`<div class="kpi"><div class="l">Dhan token</div><div class="v ${tk.valid?'ok':'bad'}">${tk.valid?'Valid':'Invalid'}</div><div class="d">${tk.hours_left!=null?tk.hours_left+' hours left':'—'} · ${tk.launchd_installed?'auto-renew on':'no agent'}</div></div>
 <div class="kpi"><div class="l">Paper account</div><div class="v">${pp.state?inr(pp.state.equity):'₹50,000'}</div><div class="d">${pp.state?('today '+(pp.state.realised>=0?'+':'')+inr(pp.state.realised)+' · '+pp.trades.length+' trades'):'not started today'}</div></div>
 <div class="kpi"><div class="l">Data through</div><div class="v" style="font-size:16px">${esc(s.data['nifty_index_1m_ext.csv'])}</div><div class="d">wings ${esc(s.data['nifty_wings_week_1m_ext.csv'])} · OI ${esc(s.data.participant_oi_last)}</div></div>
@@ -377,9 +476,22 @@ if(s.live){el('livechip').textContent=s.live.running?'LIVE RUNNING (real orders)
 el('papopen').innerHTML=pp.state?`<table><tr><th>Brain</th><th>Entries</th><th>Realised</th><th>Open position</th></tr>${Object.entries(pp.state.brains).map(([n,b])=>`<tr><td><b>${esc(n)}</b></td><td>${b.entries}/4</td><td class="${b.realised>=0?'ok':'bad'}">${(b.realised>=0?'+':'')+inr(b.realised)}</td><td>${b.open?`${b.open.leg} ${b.open.strike} @ ₹${b.open.p_in} · last ₹${b.open.last_px??'—'} · stop ${b.open.stop.toFixed(1)} · target ${b.open.target==null?'trail':b.open.target.toFixed(1)}`:'<span class="muted">none</span>'}</td></tr>`).join('')}</table>`:'<span class="muted">—</span>';
 el('paptrades').innerHTML=pp.trades.length?'<table><tr>'+['brain','entry_time','leg','strike','opt_entry','exit_time','exit_reason','opt_exit','index_move_pts','net_inr'].map(k=>'<th>'+k.replace(/_/g,' ')+'</th>').join('')+'</tr>'+pp.trades.map(t=>'<tr>'+['brain','entry_time','leg','strike','opt_entry','exit_time','exit_reason','opt_exit','index_move_pts','net_inr'].map(k=>`<td class="${k==='net_inr'?(parseFloat(t[k])>=0?'ok':'bad'):''}">${esc(t[k])}</td>`).join('')+'</tr>').join('')+'</table>':'<span class="muted">none yet</span>';
 el('paplog').textContent=pp.log||'—';el('papsess').innerHTML=pp.sessions.slice().reverse().map(f=>`<button class="btn ghost sm" onclick="api('/api/file?name=${encodeURIComponent(f)}').then(t=>el('papview').textContent=t)">${esc(f.replace('SESSION_','').replace('.md',''))}</button> `).join('');
-el('jobs_t').innerHTML='<table><tr><th>Job</th><th>PID</th><th>Status</th><th>Started</th><th>Command</th><th></th></tr>'+(dj.length?dj.map(j=>`<tr><td><b>${esc(j.name)}</b></td><td class="mono">${j.pid}</td><td>${j.running?'<span class="pill ok">running</span>':'<span class="pill muted">done rc '+j.rc+'</span>'}</td><td>${esc(j.started)}</td><td class="mono"><small>${esc(j.args)}</small></td><td><button class="btn ghost sm" onclick="api('/api/log?name=${encodeURIComponent(j.log)}').then(d=>el('joblog').textContent=d.text||'—')">Log</button> ${j.running?`<button class="btn danger sm" onclick="confirmThen('Kill job ${esc(j.name)}?','The process is terminated immediately.',()=>api('/api/job/kill?name=${esc(j.name)}').then(()=>{toast('Killed','warn');refreshAll()}))">Kill</button>`:''}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no jobs this session</td></tr>')+'</table>';
+el('jobs_t').innerHTML='<table><tr><th>Job</th><th>PID</th><th>Status</th><th>CPU</th><th>RAM</th><th>Started</th><th>Command</th><th></th></tr>'+(dj.length?dj.map(j=>`<tr><td><b>${esc(j.name)}</b></td><td class="mono">${j.pid}</td><td>${j.running?'<span class="pill ok">running</span>':'<span class="pill muted">done rc '+j.rc+'</span>'}</td><td class="mono">${rp(j.pid).cpu}</td><td class="mono">${rp(j.pid).ram}</td><td>${esc(j.started)}</td><td class="mono"><small>${esc(j.args)}</small></td><td><button class="btn ghost sm" onclick="api('/api/log?name=${encodeURIComponent(j.log)}').then(d=>el('joblog').textContent=d.text||'—')">Log</button> ${j.running?`<button class="btn danger sm" onclick="confirmThen('Kill job ${esc(j.name)}?','The process is terminated immediately.',()=>api('/api/job/kill?name=${esc(j.name)}').then(()=>{toast('Killed','warn');refreshAll()}))">Kill</button>`:''}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no jobs this session</td></tr>')+'</table>';
 el('clock').textContent='updated '+new Date().toLocaleTimeString();if(el('paper').classList.contains('on'))loadChart()}
 let TF=1;function setTf(t){TF=t;loadChart()}
+function mb(x){return x>=1024?(x/1024).toFixed(2)+' GB':Math.round(x)+' MB'}
+function drawRes(r){const tiles=el('rtiles');if(!tiles)return;if(!r||r.error){tiles.innerHTML=`<span class="muted">resource sampling unavailable${r&&r.error?': '+esc(r.error):''}</span>`;return}
+const memPct=r.mem_total_mb?r.mem_used_mb/r.mem_total_mb*100:0,algoMem=r.mem_total_mb?r.algo_rss_mb/r.mem_total_mb*100:0,cls=p=>p>=90?'bad':p>=70?'warn':'';
+tiles.innerHTML=`<div class="rtile"><div class="l">Algo CPU</div><div class="v">${r.algo_cpu.toFixed(1)}%</div><div class="d">of one core · ${r.procs.length} process${r.procs.length===1?'':'es'}</div><div class="meter"><i class="${cls(r.algo_cpu/r.ncpu)}" style="width:${Math.min(100,r.algo_cpu/r.ncpu)}%"></i></div></div>
+<div class="rtile"><div class="l">Algo RAM</div><div class="v">${mb(r.algo_rss_mb)}</div><div class="d">${algoMem.toFixed(1)}% of ${mb(r.mem_total_mb)} (resident)</div><div class="meter"><i class="${cls(algoMem)}" style="width:${Math.min(100,algoMem)}%"></i></div></div>
+<div class="rtile"><div class="l">Machine CPU</div><div class="v">${r.sys_cpu==null?'—':r.sys_cpu.toFixed(0)+'%'}</div><div class="d">${r.ncpu} cores${r.load?' · load '+r.load.join(' / '):''}${r.temp_c!=null?' · '+r.temp_c.toFixed(0)+' °C':''}</div><div class="meter"><i class="${cls(r.sys_cpu||0)}" style="width:${Math.min(100,r.sys_cpu||0)}%"></i></div></div>
+<div class="rtile"><div class="l">Machine RAM</div><div class="v">${mb(r.mem_used_mb)}</div><div class="d">${memPct.toFixed(0)}% of ${mb(r.mem_total_mb)} used</div><div class="meter"><i class="${cls(memPct)}" style="width:${Math.min(100,memPct)}%"></i></div></div>`;
+el('rprocs').innerHTML=r.procs.length?'<table><tr><th>Process</th><th>PID</th><th>CPU</th><th>RAM</th><th>Running for</th></tr>'+r.procs.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td class="mono">${p.pid}</td><td class="mono">${p.cpu_pct.toFixed(1)}%</td><td class="mono">${mb(p.rss_mb)}</td><td class="mono">${esc(p.elapsed)}</td></tr>`).join('')+'</table>':'<span class="muted">no algo processes found</span>';
+const h=r.hist||[];const span=h.length>1?h[h.length-1][0]-h[0][0]:0;el('rspan').textContent=span>=60?`last ${Math.round(span/60)} min`:span>0?`last ${span} s`:'';const cv=el('rchart');const W=cv.width=cv.clientWidth*2,H=cv.height=120*2;const g=cv.getContext('2d');g.clearRect(0,0,W,H);if(h.length<2)return;
+const padL=8,padR=150,padT=14,padB=10;const top=Math.max(100,...h.map(x=>Math.max(x[1]||0,x[2]||0)))*1.05;const y=v=>padT+(1-v/top)*(H-padT-padB);const x=i=>padL+i/(h.length-1)*(W-padL-padR);
+g.font='18px -apple-system,Helvetica';g.lineWidth=2;[0,50,100].forEach(v=>{if(v>top)return;g.strokeStyle='#1b2430';g.beginPath();g.moveTo(padL,y(v));g.lineTo(W-padR,y(v));g.stroke();g.fillStyle='#8fa0b3';g.fillText(v+'%',padL+6,y(v)-5)});
+const line=(idx,color)=>{g.strokeStyle=color;g.lineWidth=3;g.beginPath();let f=true;h.forEach((p,i)=>{if(p[idx]==null)return;f?g.moveTo(x(i),y(p[idx])):g.lineTo(x(i),y(p[idx]));f=false});g.stroke()};
+line(1,'#d97706');line(2,'#3b82f6');const last=h[h.length-1];g.font='bold 18px -apple-system,Helvetica';let ya=y(last[2]),ym=last[1]==null?null:y(last[1]);if(ym!=null&&Math.abs(ya-ym)<24){const mid=(ya+ym)/2;ya=mid+(ya>=ym?12:-12);ym=mid+(ya>=ym?-12:12)}g.fillStyle='#3b82f6';g.fillText(last[2].toFixed(0)+'% algo',W-padR+8,Math.max(padT+8,Math.min(H-padB,ya+6)));if(ym!=null){g.fillStyle='#d97706';g.fillText(last[1].toFixed(0)+'% machine',W-padR+8,Math.max(padT+8,Math.min(H-padB,ym+6)))}}
 async function loadChart(){let d;try{d=await api('/api/chart?tf='+TF)}catch(e){return}el('tf1').classList.toggle('ghost',TF!==1);el('tf5').classList.toggle('ghost',TF!==5);
 if(d.error){el('chartsrc').textContent=d.error;return}el('chartsrc').textContent=`${d.date} · ${d.tf}m · ${d.source} · ${d.ltp!=null?'LTP '+d.ltp.toFixed(2):'last '+d.last.t+' '+d.last.c.toFixed(1)}`;
 if(d.forming&&d.tf===1){d.bars=d.bars.concat([{t:d.forming[0],o:d.forming[1],h:d.forming[2],l:d.forming[3],c:d.forming[4],ema9:d.bars.length?d.bars[d.bars.length-1].ema9:d.forming[4],forming:true}])}
@@ -438,7 +550,9 @@ class H(BaseHTTPRequestHandler):
         if p == "/":
             b = HTML.encode(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
         if p == "/api/status":
-            return self._json({"token": token_status(), "data": data_status(), "paper": paper_status(), "live": live_status(), "jobs": job_status()})
+            return self._json({"token": token_status(), "data": data_status(), "paper": paper_status(), "live": live_status(), "jobs": job_status(), "res": resources()})
+        if p == "/api/resources":
+            return self._json(resources())
         if p == "/api/backtests":
             return self._json(backtest_list())
         if p == "/api/chart":
@@ -543,6 +657,7 @@ class H(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--port", type=int, default=8765); a = ap.parse_args()
     (ROOT / "tools" / "wings_backfill.py").exists() or None
+    threading.Thread(target=_res_loop, daemon=True, name="resources").start()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H); print(f"dashboard: http://127.0.0.1:{a.port}  (local only; Ctrl-C to stop)", flush=True)
     try:
         srv.serve_forever()

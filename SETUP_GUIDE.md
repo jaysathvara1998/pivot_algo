@@ -175,6 +175,8 @@ sudo systemctl enable --now pivot-dashboard
 
 It binds to 127.0.0.1:8765 only. From your laptop: `ssh -L 8765:127.0.0.1:8765 user@server`, then open http://127.0.0.1:8765. Working pages: Overview, Paper trading (start/stop paper and live, chart, trades), Token, Journal, Jobs. Backtests and Data pages are empty on this deployment.
 
+The Overview page has a **Resources** card: CPU and RAM of every algo process (feed, paper trader, live trader, dashboard, background jobs) plus the machine's CPU, RAM, load and, on a Pi, the SoC temperature, with a 15-minute CPU history. Nothing to install: it reads `/proc` on Linux (`ps` on macOS). The same numbers are available as JSON at `http://127.0.0.1:8765/api/resources` (algo CPU is the sum over processes in % of one core; machine CPU is % of all cores). The Jobs page shows CPU/RAM per job.
+
 ---
 
 ## 10. Automation (cron)

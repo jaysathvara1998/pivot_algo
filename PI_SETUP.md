@@ -150,6 +150,7 @@ Set `LIVE=1` there only if you want the live trader to resume by itself after a 
 ## 8. Keeping an eye on it
 
 - **Telegram** is the primary monitor: trader start/stop, every entry and exit, warnings, the session summary.
+- **Dashboard → Overview → Resources**: CPU and RAM of the feed, trader(s) and dashboard, the Pi's total CPU/RAM/load and SoC temperature, with a 15-minute CPU history (also as JSON at `/api/resources`). On a Pi 4/5 the whole algo idles at a few percent of one core and well under 200 MB; sustained high CPU or RAM growing day over day means something is wrong.
 - **Health in one command** (run over SSH or from the dashboard's Overview page):
 
 ```bash
