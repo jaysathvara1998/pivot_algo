@@ -46,6 +46,13 @@ def tail(path, n=60):
         return ""
 
 
+def _tg_channel():
+    try:
+        return json.loads(TG_FILE.read_text()).get("channel")
+    except Exception:
+        return None
+
+
 def token_status():
     rc, out = run_capture([PY, "tools/dhan_token.py", "verify"], timeout=30)
     try:
@@ -53,7 +60,7 @@ def token_status():
     except Exception:
         hrs = None
     plist = Path.home() / "Library/LaunchAgents/com.tradingalgo.dhan-token.plist"
-    return {"valid": rc == 0, "detail": out.strip()[-400:], "hours_left": hrs, "credentials_saved": CRED_FILE.exists(), "telegram_saved": TG_FILE.exists(), "launchd_installed": plist.exists(), "token_log": tail(Path.home() / ".dhan" / "token.log", 8)}
+    return {"valid": rc == 0, "detail": out.strip()[-400:], "hours_left": hrs, "credentials_saved": CRED_FILE.exists(), "telegram_saved": TG_FILE.exists(), "telegram_channel": _tg_channel(), "launchd_installed": plist.exists(), "token_log": tail(Path.home() / ".dhan" / "token.log", 8)}
 
 
 def data_status():
@@ -419,7 +426,8 @@ section{display:none}section.on{display:block}.spin{display:inline-block;width:1
 <label class="f">PIVOT ITM strikes<select id="pitm"><option value="2" selected>2 — in the money (V1)</option><option value="0">0 — at the money</option></select></label><label class="f">PIVOT R:R<input id="prr" value="3" style="width:70px"></label><label class="f">VWAP R (pts)<input id="pr" value="7" style="width:70px"></label><label class="f">Premium cap ₹ (0 = none)<input id="pcap" value="15000" style="width:100px"></label></div>
 <div class="row"><label class="chk"><input type="checkbox" id="pfeed" checked> use live feed (tick data, fills at LTP)</label></div>
 <div class="row"><button class="btn ok" id="startbtn" onclick="startPaper()">▶ Start paper trader</button><button class="btn danger" id="stopbtn" onclick="confirmThen('Stop the paper trader?','Any open paper position will not be closed in the log. Prefer stopping after 15:15.',()=>stopProc('/api/paper/stop','Stopping…'))">■ Stop</button></div></div>
-<div class="card"><h3>Telegram alerts</h3><p class="muted" style="margin:0 0 8px">Create a bot with @BotFather, send it one message, paste the bot token here. Alerts fire on every entry, exit, day stop and the session summary.</p><div class="row"><input id="tgtok" type="password" placeholder="bot token" style="flex:1;min-width:200px"><button class="btn sm" onclick="postAct('/api/telegram/setup',{token:v('tgtok')},'Connecting Telegram…')">Setup</button><button class="btn ghost sm" onclick="act('/api/telegram/test','Sending test…')">Test</button></div></div></div>
+<div class="card"><h3>Telegram alerts</h3><p class="muted" style="margin:0 0 8px">Create a bot with @BotFather, send it one message, paste the bot token here. Your private chat gets everything: signals, warnings and order failures.</p><div class="row"><input id="tgtok" type="password" placeholder="bot token" style="flex:1;min-width:200px"><button class="btn sm" onclick="postAct('/api/telegram/setup',{token:v('tgtok')},'Connecting Telegram…')">Setup</button><button class="btn ghost sm" onclick="act('/api/telegram/test','Sending test…')">Test</button></div>
+<p class="muted" style="margin:10px 0 6px"><b>Channel for members</b> (optional): create a channel, add the bot as administrator with <b>Post messages</b>, then enter its @name (public) or -100… id (private). The channel receives only the signals: trader start, ENTRY, EXIT, day stop and the session summary. Current: <span id="tgchan" class="mono">—</span></p><div class="row"><input id="tgchanin" placeholder="@channelname or -100…" style="flex:1;min-width:200px"><button class="btn sm" onclick="postAct('/api/telegram/channel',{channel:v('tgchanin')},'Connecting channel…')">Add channel</button><button class="btn ghost sm" onclick="act('/api/telegram/test_channel','Sending channel test…')">Test channel</button><button class="btn ghost sm" onclick="confirmThen('Remove the channel?','Signals will go to your private chat only.',()=>postAct('/api/telegram/channel',{channel:'off'},'Removing channel…'))">Remove</button></div></div></div>
 <div class="card"><h3>Live chart <span class="tag" id="chartsrc"></span><span style="margin-left:auto" class="row"><button class="btn ghost sm" id="tf1" onclick="setTf(1)">1m</button><button class="btn ghost sm" id="tf5" onclick="setTf(5)">5m</button><button class="btn ghost sm" onclick="loadChart()">↻</button></span></h3>
 <div class="grid" style="grid-template-columns:3fr 1fr;gap:14px"><div><canvas id="chart" width="1000" height="420" style="width:100%;height:420px;background:#0a0e13;border:1px solid var(--line);border-radius:10px"></canvas><div class="muted" style="font-size:12px;margin-top:6px">Candles = NIFTY spot · <span style="color:#f59e0b">VWAP</span> · <span style="color:#a78bfa">EMA 9</span> · dashed = daily pivots P / R1 / R2 / S1 / S2 · ▲ CE entry · ▼ PE entry · ◆ exit (green win / red loss) · ○ open position with its stop (red) and target (green)</div></div>
 <div><h4 style="margin:0 0 6px">Trade feed</h4><div id="feed" style="max-height:200px;overflow:auto;font-size:12.5px"></div><h4 style="margin:10px 0 6px">Option quotes</h4><div id="quotes" style="font-size:12px"></div></div></div></div>
@@ -465,8 +473,8 @@ el('kpis').innerHTML=`<div class="kpi"><div class="l">Dhan token</div><div class
 <div class="kpi"><div class="l">Paper account</div><div class="v">${pp.state?inr(pp.state.equity):'₹50,000'}</div><div class="d">${pp.state?('today '+(pp.state.realised>=0?'+':'')+inr(pp.state.realised)+' · '+pp.trades.length+' trades'):'not started today'}</div></div>
 <div class="kpi"><div class="l">Data through</div><div class="v" style="font-size:16px">${esc(s.data['nifty_index_1m_ext.csv'])}</div><div class="d">wings ${esc(s.data['nifty_wings_week_1m_ext.csv'])} · OI ${esc(s.data.participant_oi_last)}</div></div>
 <div class="kpi"><div class="l">Paper trader</div><div class="v ${pp.running?'ok':'muted'}">${pp.running?'Running':'Idle'}</div><div class="d">${pp.state&&pp.state.halted?'DAY STOP HIT':(pp.running?'polling every minute':'start before 09:15')}</div></div>`;
-el('health').innerHTML=`<table><tr><th>Item</th><th>State</th></tr><tr><td>Token</td><td class="${tk.valid?'ok':'bad'}">${tk.valid?'valid':'invalid — go to Token'}</td></tr><tr><td>TOTP credentials</td><td>${tk.credentials_saved?'<span class="ok">saved</span>':'<span class="warn">not saved — automation cannot regenerate</span>'}</td></tr><tr><td>Launchd agent</td><td>${tk.launchd_installed?'<span class="ok">installed (08:30 / 20:30)</span>':'<span class="warn">not installed</span>'}</td></tr><tr><td>Telegram</td><td>${tk.telegram_saved?'<span class="ok">connected</span>':'<span class="muted">off</span>'}</td></tr><tr><td>Index 1m / ATM / wings</td><td class="mono">${esc(s.data['nifty_index_1m_ext.csv'])} / ${esc(s.data['nifty_atm_week_1m_ext.csv'])} / ${esc(s.data['nifty_wings_week_1m_ext.csv'])}</td></tr></table>`;
-el('tokenlog').textContent=tk.token_log||'—';el('tokstat').innerHTML=`<pre class="mono" style="max-height:200px">${esc(tk.detail)}</pre>`;
+el('health').innerHTML=`<table><tr><th>Item</th><th>State</th></tr><tr><td>Token</td><td class="${tk.valid?'ok':'bad'}">${tk.valid?'valid':'invalid — go to Token'}</td></tr><tr><td>TOTP credentials</td><td>${tk.credentials_saved?'<span class="ok">saved</span>':'<span class="warn">not saved — automation cannot regenerate</span>'}</td></tr><tr><td>Launchd agent</td><td>${tk.launchd_installed?'<span class="ok">installed (08:30 / 20:30)</span>':'<span class="warn">not installed</span>'}</td></tr><tr><td>Telegram</td><td>${tk.telegram_saved?'<span class="ok">connected</span>'+(tk.telegram_channel?' · channel <span class="mono">'+esc(String(tk.telegram_channel))+'</span>':' · <span class="muted">no channel</span>'):'<span class="muted">off</span>'}</td></tr><tr><td>Index 1m / ATM / wings</td><td class="mono">${esc(s.data['nifty_index_1m_ext.csv'])} / ${esc(s.data['nifty_atm_week_1m_ext.csv'])} / ${esc(s.data['nifty_wings_week_1m_ext.csv'])}</td></tr></table>`;
+el('tokenlog').textContent=tk.token_log||'—';if(el('tgchan'))el('tgchan').textContent=tk.telegram_channel?String(tk.telegram_channel):'none';el('tokstat').innerHTML=`<pre class="mono" style="max-height:200px">${esc(tk.detail)}</pre>`;
 el('datcov').innerHTML=`<table>${Object.entries(s.data).map(([k,x])=>`<tr><td class="mono">${esc(k)}</td><td>${esc(x)}</td></tr>`).join('')}</table>`;const dlog=dj.filter(j=>j.name==='data'||j.name==='wings').pop();if(dlog)api('/api/log?name='+dlog.log).then(d=>el('datlog').textContent=d.text||'—');
 const bl=await api('/api/backtests');el('btcount').textContent=bl.backtests.length+' reports';
 el('btlist').innerHTML='<table><tr><th>Report</th><th>Result</th><th></th></tr>'+bl.backtests.map(b=>{const m=b.result.match(/(\d+) trades.*?wins (\d+) \((\d+)%\).*?net ₹([+-][\d,]+)\/trade.*?t ([+-][\d.]+).*?→ ₹(-?[\d,]+) \(net ₹([+-][\d,]+)\).*?drawdown (-?[\d.]+)%/);const w=b.file.replace('BACKTEST_','').replace('.md','');const net=m?m[7]:'';return `<tr><td><b>${esc(w.split('_20')[0])}</b><br><span class="badge">${esc(w.slice(w.indexOf('_20')+1))}</span><br><small class="muted">${b.modified}</small></td><td class="result-line">${m?`<b class="${net.startsWith('+')?'ok':'bad'}">net ₹${m[7]}</b> · ${m[1]} trades · win ${m[3]}% · t ${m[5]} · ending ₹${m[6]} · max DD ${m[8]}%`:esc(b.result)}</td><td><button class="btn ghost sm" onclick="api('/api/file?name=${encodeURIComponent(b.file)}').then(t=>{el('btview').textContent=t;window.scrollTo({top:el('btview').offsetTop-80,behavior:'smooth'})})">View</button></td></tr>`}).join('')+'</table>';
@@ -568,6 +576,8 @@ class H(BaseHTTPRequestHandler):
             rc, out = run_capture([PY, "tools/dhan_token.py", "install-launchd", "--then-update"], 30); return self._json({"rc": rc, "out": out})
         if p == "/api/telegram/test":
             rc, out = run_capture([PY, "tools/paper_trade.py", "--telegram-test"], 30); return self._json({"rc": rc, "out": out})
+        if p == "/api/telegram/test_channel":
+            rc, out = run_capture([PY, "tools/paper_trade.py", "--telegram-test-channel"], 30); return self._json({"rc": rc, "out": out})
         if p == "/api/journal/rebuild":
             rc, out = run_capture([PY, "tools/journal.py"], 300); return self._json({"rc": rc, "out": out})
         if p == "/api/feed/start":
@@ -619,6 +629,8 @@ class H(BaseHTTPRequestHandler):
             rc, out = run_capture([PY, "tools/dhan_token.py", "setup", "--from-env"], 30, env={k: v for k, v in env.items() if v}); return self._json({"rc": rc, "out": out})
         if p == "/api/telegram/setup":
             rc, out = run_capture([PY, "tools/paper_trade.py", "--telegram-setup", b.get("token", "")], 30); return self._json({"rc": rc, "out": out})
+        if p == "/api/telegram/channel":
+            rc, out = run_capture([PY, "tools/paper_trade.py", "--telegram-channel", b.get("channel", "") or "off"], 30); return self._json({"rc": rc, "out": out})
         if p == "/api/journal/note":
             dd, txt = (b.get("date") or "").strip(), (b.get("text") or "").strip()
             if not (dd and txt):

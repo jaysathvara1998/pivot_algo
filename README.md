@@ -17,7 +17,7 @@ sh deploy/install.sh
 python3 tools/dhan_token.py setup          # client id, PIN, TOTP secret → ~/.dhan/credentials.json
 python3 tools/dhan_token.py auto           # 24 h token → ~/.dhan/access_token
 python3 tools/dhan_token.py verify
-python3 tools/paper_trade.py --telegram-setup <BOT_TOKEN>   # optional
+python3 tools/paper_trade.py --telegram-setup <BOT_TOKEN>   # optional; add --telegram-channel @name for a members' channel (signals only)
 python3 tools/fetch_recent.py              # pulls the latest sessions into datasets/raw/dhan (the previous session is needed for the pivots)
 python3 tools/live_broker.py               # read-only live preflight: token, funds, stray positions, week brake
 crontab deploy/crontab.txt                 # token 08:30/20:30, session 09:00, stop 15:40, data 15:45

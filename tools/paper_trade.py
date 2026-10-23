@@ -6,10 +6,10 @@
 Each brain holds at most one position; both may be open at once. Fills at the signal minute's option close + ₹0.50 (exit −₹0.50), costs per leg as the backtests,
 1 lot per trade if premium × lot ≤ ₹12,500, day stop −₹5,000 (combined), max 4 entries per brain, entries 09:20/09:45–15:00, everything flat by 15:15.
 Live:   python3 tools/paper_trade.py [--brains PIVOT,EXPIRY] [--r 7] [--rr 3]      Replay: python3 tools/paper_trade.py --date 2026-10-09 --replay
-Telegram: --telegram-setup BOT_TOKEN once; alerts on entry / exit / day stop / session summary. Files: paper/TRADES_<date>.csv, paper/STATE_<date>.json, paper/SESSION_<date>.md."""
+Telegram: --telegram-setup BOT_TOKEN once (private chat: everything); --telegram-channel @name adds a channel for members (start / entry / exit / day stop / session summary only). Files: paper/TRADES_<date>.csv, paper/STATE_<date>.json, paper/SESSION_<date>.md."""
 from __future__ import annotations
 
-import argparse, csv, json, os, sys, time, urllib.request
+import argparse, csv, json, os, re, sys, time, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -106,23 +106,32 @@ def option_price(atm, k, leg, strike):
 
 # ---------------- Telegram ----------------
 def tg_config():
+    """(bot_token, private chat id, channel or None). The private chat gets everything; the channel (optional, for other members) gets only the public signals: start, ENTRY, EXIT, day stop, session summary."""
     c = json.loads(TG_FILE.read_text()) if TG_FILE.exists() else {}
-    tok = os.environ.get("TELEGRAM_BOT_TOKEN") or c.get("bot_token"); chat = os.environ.get("TELEGRAM_CHAT_ID") or c.get("chat_id")
-    return (tok, chat) if tok and chat else (None, None)
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN") or c.get("bot_token"); chat = os.environ.get("TELEGRAM_CHAT_ID") or c.get("chat_id"); chan = os.environ.get("TELEGRAM_CHANNEL") or c.get("channel")
+    return (tok, chat, chan or None) if tok and chat else (None, None, None)
 
 
-def tg_send(text):
+def _tg_post(tok, chat_id, text):
+    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=json.dumps({"chat_id": chat_id, "text": text, "disable_web_page_preview": True}).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read()).get("ok", False)
+
+
+def tg_send(text, public=False):
+    """Sends to the private chat; with public=True also to the channel if one is configured. Returns True if at least one delivery succeeded."""
     if os.environ.get("TRADINGALGO_NO_TG"):
         return False
-    tok, chat = tg_config()
+    tok, chat, chan = tg_config()
     if not tok:
         return False
-    try:
-        req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=json.dumps({"chat_id": chat, "text": text, "disable_web_page_preview": True}).encode(), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read()).get("ok", False)
-    except Exception as e:
-        print(f"telegram send failed: {str(e)[:100]}", flush=True); return False
+    ok = False
+    for target in ([chat] + ([chan] if public and chan else [])):
+        try:
+            ok = _tg_post(tok, target, text) or ok
+        except Exception as e:
+            print(f"telegram send to {target} failed: {str(e)[:100]}", flush=True)
+    return ok
 
 
 def tg_setup(bot_token):
@@ -139,8 +148,35 @@ def tg_setup(bot_token):
     if not chats:
         sys.exit("no chats found: send any message to your bot first, then run again")
     chat_id = next(iter(chats)) if len(chats) == 1 else int(input(f"several chats {chats}; chat id to use: "))
-    TG_FILE.parent.mkdir(mode=0o700, exist_ok=True); TG_FILE.write_text(json.dumps({"bot_token": bot_token, "chat_id": chat_id})); os.chmod(TG_FILE, 0o600)
+    keep = json.loads(TG_FILE.read_text()) if TG_FILE.exists() else {}
+    TG_FILE.parent.mkdir(mode=0o700, exist_ok=True); TG_FILE.write_text(json.dumps({**keep, "bot_token": bot_token, "chat_id": chat_id})); os.chmod(TG_FILE, 0o600)
     print("saved", TG_FILE, "test", "sent" if tg_send("TradingAlgo paper trader connected (2 brains: VWAP, PIVOT).") else "FAILED")
+
+
+def tg_channel(channel):
+    """Add (or with 'off' remove) a Telegram channel that receives the public signals so other members can follow. The bot must be an administrator of the channel with permission to post.
+    channel: @publicname, or the numeric id (-100…) for a private channel, or an invite-less private channel id from getUpdates after one post in it."""
+    c = json.loads(TG_FILE.read_text()) if TG_FILE.exists() else {}
+    if not c.get("bot_token"):
+        sys.exit("run --telegram-setup BOT_TOKEN first (the private chat stays the operator's channel for warnings and failures)")
+    if channel.strip().lower() in ("off", "none", ""):
+        c.pop("channel", None); TG_FILE.write_text(json.dumps(c)); os.chmod(TG_FILE, 0o600); print("channel removed; alerts go to the private chat only"); return
+    ch = channel.strip()
+    if not ch.startswith("@") and not re.fullmatch(r"-?\d+", ch):
+        ch = "@" + ch
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{c['bot_token']}/getChat?chat_id={urllib.parse.quote(ch)}", timeout=15) as r:
+            info = json.loads(r.read()).get("result", {})
+    except Exception as e:
+        sys.exit(f"getChat failed for {ch}: {str(e)[:160]}\n  make the bot an administrator of the channel (with 'Post messages'), then retry; for a private channel use its numeric id (-100…)")
+    if info.get("type") not in ("channel", "supergroup", "group"):
+        sys.exit(f"{ch} is a {info.get('type')} chat, not a channel or group")
+    c["channel"] = info.get("id", ch); TG_FILE.write_text(json.dumps(c)); os.chmod(TG_FILE, 0o600)
+    try:
+        sent = _tg_post(c["bot_token"], c["channel"], f"TradingAlgo signals connected to this channel ({info.get('title') or ch}). You will see trader start, every ENTRY and EXIT, day stops and the session summary.")
+    except Exception as e:
+        sent = False; print(f"test post failed: {str(e)[:160]} — is the bot an admin with 'Post messages'?")
+    print("saved", TG_FILE, f"channel {info.get('title') or ch} (id {c['channel']})", "test post", "sent" if sent else "FAILED")
 
 
 # ---------------- Brains ----------------
@@ -834,7 +870,7 @@ class Paper:
                     note = f"{note} · broker legs: target ₹{super_legs['target']:.2f} / stop ₹{super_legs['stop']:.2f} (delta {super_legs['delta']:.2f})"; st_["open"]["note"] = note
                 st_["entries"] += 1; self.save()
                 msg = f"[{brain.name}] {k} ENTRY BUY {leg} {K:.0f} × {self.lot} @ ₹{p_in:.2f} (₹{p_in * self.lot:,.0f}) index {e:.1f} stop {stop:.1f} target {('%.1f' % target) if target is not None else 'trail'} {note} · entries {st_['entries']}/{MAX_ENTRIES}{(' · order ' + order_id) if order_id else ''}{(' · broker legs target ₹%.2f / stop ₹%.2f' % (super_legs['target'], super_legs['stop'])) if super_legs else ''}"
-                self.say(msg); tg_send(f"{'🟢' if self.tag == 'PAPER' else '💰'} {self.tag} ENTRY {self.d}\n{msg}"); break
+                self.say(msg); tg_send(f"{'🟢' if self.tag == 'PAPER' else '💰'} {self.tag} ENTRY {self.d}\n{msg}", public=True); break
 
     def close(self, brain, pos, k, why, idx_px, opt_px, note, broker_fill=None):
         p_out = (opt_px if opt_px is not None else pos["p_in"]) - SLIP; lot = self.lot
@@ -859,9 +895,9 @@ class Paper:
         if hasattr(brain, "on_exit"):
             brain.on_exit(pos, why, k)
         msg = f"[{brain.name}] {k} EXIT {why} SELL {pos['leg']} {pos['strike']:.0f} @ ₹{p_out:.2f} index {idx_px:.1f} ({mv:+.1f} pts) net ₹{net:+,.0f} (cost ₹{cost:.0f}) · brain ₹{st_['realised']:+,.0f} · account ₹{self.state['equity']:,.0f} {note}"
-        self.say(msg); tg_send(f"{'🔴' if net < 0 else '🔵'} {self.tag} EXIT {why} {self.d}\n{msg}")
+        self.say(msg); tg_send(f"{'🔴' if net < 0 else '🔵'} {self.tag} EXIT {why} {self.d}\n{msg}", public=True)
         if self.state["realised"] <= DAY_STOP and not self.state["halted"]:
-            self.state["halted"] = True; m2 = f"DAY STOP reached (₹{self.state['realised']:+,.0f}): no further entries from any brain today"; self.say(m2); tg_send(f"⛔ {m2}")
+            self.state["halted"] = True; m2 = f"DAY STOP reached (₹{self.state['realised']:+,.0f}): no further entries from any brain today"; self.say(m2); tg_send(f"⛔ {m2}", public=True)
         self.save()
 
     def force_close_all(self, bars, atm, note):
@@ -895,11 +931,13 @@ class Paper:
             lines += [f"| {t['entry_time']} | {t['leg']} | {t['strike']} | {t['p_in']} | {t['exit_time']} | {t['why']} | {t['p_out']} | {t['move']} | {t['net']} | {t['note']} |" for t in tr] + [""]
             tg.append(f"{brain.name}: {len(tr)} trades, {wins} wins, net ₹{st_['realised']:+,.0f}" + "".join(f"\n  {t['entry_time']} {t['leg']} {t['strike']} {t['p_in']}→{t['p_out']} {t['why']} ₹{t['net']}" for t in tr))
         (self.dir / f"SESSION_{self.d}.md").write_text("\n".join(lines) + "\n"); print("\n".join(lines))
+        if self.dir.name != "replay":
+            tg_send("\n".join(tg), public=True)
         if self.dir.name not in ("replay", "live", "live_dryrun"):                          # paper session → rebuild the trading journal (the live ledger is kept separately in paper/live)
             try:
                 import subprocess; subprocess.run([sys.executable, str(ROOT / "tools" / "journal.py")], cwd=str(ROOT), timeout=300); print("journal rebuilt", flush=True)
             except Exception as e:
-                print(f"journal rebuild failed: {str(e)[:80]}", flush=True); tg_send("\n".join(tg))
+                print(f"journal rebuild failed: {str(e)[:80]}", flush=True); tg_send(f"⚠️ journal rebuild failed: {str(e)[:80]}")
 
 
 def main():
@@ -909,7 +947,7 @@ def main():
     ap.add_argument("--pivot-itm", type=int, default=0, help="PIVOT brain: buy this many strikes in the money (0 = ATM; 2 = V1)"); ap.add_argument("--pivot-cap", type=float, default=15000.0, help="premium cap per lot in ₹ for every brain; 0 = no cap. ₹15,000 is the tested rule (removing it turned +₹32.9k into −₹1.6k on six months: expensive premiums mark high-volatility days where close-based stops overrun)")
     ap.add_argument("--log", default=None, help="append all output to this file as well")
     ap.add_argument("--feed", action="store_true", help="use the live WebSocket feed snapshot (tools/dhan_feed.py must be running) instead of polling the historical API; acts within seconds of a bar close and fills at the live option LTP")
-    ap.add_argument("--telegram-setup", metavar="BOT_TOKEN"); ap.add_argument("--telegram-test", action="store_true")
+    ap.add_argument("--telegram-setup", metavar="BOT_TOKEN"); ap.add_argument("--telegram-test", action="store_true", help="send a test message to the private chat"); ap.add_argument("--telegram-test-channel", action="store_true", help="send a test message to the channel only"); ap.add_argument("--telegram-channel", metavar="CHANNEL", help="@name or -100… id of a channel the bot administers; public signals are posted there too ('off' to remove)")
     ap.add_argument("--live", action="store_true", help="LIVE MODE: place real 1-lot market orders on Dhan for every entry/exit (ledger in paper/live/). Requires --i-accept-live-risk.")
     ap.add_argument("--i-accept-live-risk", action="store_true", help="required with --live"); ap.add_argument("--no-super", action="store_true", help="with --live: plain market orders and our own close-based exits instead of Dhan super orders (broker-side target/stop legs)"); ap.add_argument("--dry-run", action="store_true", help="with --live: run the live code path with synthetic fills and no orders")
     a = ap.parse_args(); d = date.fromisoformat(a.date)
@@ -924,8 +962,19 @@ def main():
         sys.stdout = _Tee(a.log)
     if a.telegram_setup:
         tg_setup(a.telegram_setup); return
+    if a.telegram_channel is not None:
+        tg_channel(a.telegram_channel); return
     if a.telegram_test:
-        print("sent" if tg_send(f"TradingAlgo test alert {datetime.now(IST).strftime('%H:%M:%S')}") else "not sent (configure with --telegram-setup BOT_TOKEN)"); return
+        print("sent to private chat" if tg_send(f"TradingAlgo test alert {datetime.now(IST).strftime('%H:%M:%S')}") else "not sent (configure with --telegram-setup BOT_TOKEN)"); return
+    if a.telegram_test_channel:
+        tok, _, chan = tg_config()
+        if not tok or not chan:
+            sys.exit("no channel configured (add one with --telegram-channel @name)")
+        try:
+            print(f"sent to channel {chan}" if _tg_post(tok, chan, f"TradingAlgo channel test {datetime.now(IST).strftime('%H:%M:%S')} — signals will appear here") else f"not sent to channel {chan}")
+        except Exception as e:
+            sys.exit(f"channel send failed: {str(e)[:160]} — is the bot still an admin with 'Post messages'?")
+        return
     if a.replay:
         for f in (out / f"STATE_{d}.json", out / f"TRADES_{d}.csv"):
             if f.exists():
@@ -974,7 +1023,7 @@ def main():
         pv = daily_pivots(kbars(prev, 5))
         print(f"previous session {prev[0].timestamp.date()}: H {max(b.high for b in prev):.1f} L {min(b.low for b in prev):.1f} C {prev[-1].close:.1f}", flush=True)
     if not a.replay:
-        tg_send(f"▶️ {'LIVE trader started — REAL ORDERS' if (a.live and not a.dry_run) else 'Paper trader started'} {d} · brains {', '.join(b.name for b in brains)} · R={a.r:g} · PIVOT 1:{a.rr:g} · equity ₹{P.state['equity']:,.0f}")
+        tg_send(f"▶️ {'LIVE trader started — REAL ORDERS' if (a.live and not a.dry_run) else 'Paper trader started'} {d} · brains {', '.join(b.name for b in brains)} · R={a.r:g} · PIVOT 1:{a.rr:g} · equity ₹{P.state['equity']:,.0f}", public=True)
     if a.replay:
         bars = bars_for(d); atm = atm_for(d)
         for done in range(1, len(bars) + 1):

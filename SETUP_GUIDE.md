@@ -99,6 +99,22 @@ python3 tools/paper_trade.py --telegram-test
 
 You will receive: trader start/stop, every ENTRY and EXIT (tagged PAPER or LIVE), day stop, refused signals, feed warnings, live order failures, and the end-of-session summary with the running capital.
 
+### Channel for other members (optional)
+
+Your private chat stays the operator's line (it gets everything, including warnings and order failures). To let other people follow the signals, add a channel: it receives only trader start, ENTRY, EXIT, day stop and the session summary.
+
+1. In Telegram create a channel (public with an @name, or private).
+2. Channel → Administrators → Add administrator → your bot, with **Post messages** enabled.
+3. On the server (or in the dashboard's Paper trading page → Telegram alerts → Add channel):
+
+```bash
+python3 tools/paper_trade.py --telegram-channel @yourchannel      # public channel; for a private one use its numeric id (-100…)
+python3 tools/paper_trade.py --telegram-test-channel              # test post to the channel only (--telegram-test goes to your private chat)
+python3 tools/paper_trade.py --telegram-channel off               # remove the channel again
+```
+
+To find a private channel's id: post anything in it after adding the bot, open `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` and read `channel_post.chat.id`. Note the session summary and the start message include your equity / running capital; members will see those numbers.
+
 ---
 
 ## 6. Data bootstrap
