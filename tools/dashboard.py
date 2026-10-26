@@ -305,6 +305,17 @@ def chart_data(tf=1):
     return data
 
 
+def manual_order(*args, timeout=60):
+    """Runs tools/manual_order.py and returns its JSON object (or {'error': …})."""
+    rc, out = run_capture([PY, "tools/manual_order.py", *[str(a) for a in args]], timeout)
+    for ln in reversed(out.strip().splitlines()):
+        try:
+            return json.loads(ln)
+        except Exception:
+            continue
+    return {"error": (out.strip()[-300:] or f"exit {rc}")}
+
+
 def backtest_list():
     rows = []
     for p in sorted(PAPER.glob("BACKTEST_*.md"), key=lambda x: x.stat().st_mtime, reverse=True):
@@ -419,6 +430,11 @@ section{display:none}section.on{display:block}.spin{display:inline-block;width:1
 <div class="row"><span class="chip" id="livechip">live idle</span><span class="chip" id="liveweek">week ₹0</span><span class="chip" id="livefunds">Dhan funds —</span></div>
 <div class="row"><input id="liveconfirm" placeholder="type LIVE to confirm" style="width:200px"><button class="btn danger" id="livestart" onclick="startLive()">💰 Start LIVE trader</button><button class="btn" id="livestop" onclick="confirmThen('Stop the LIVE trader?','If a live position is open it will NOT be closed by stopping — exit it on Dhan yourself.',()=>stopProc('/api/live/stop','Stopping live…'))">■ Stop live</button></div>
 <div id="livetrades" class="muted" style="font-size:12px;margin-top:6px">—</div></div>
+<div class="card" style="border:1px solid #b45309;margin-bottom:14px"><h3 style="color:#fcd34d">Manual test order <span class="tag">REAL order on Dhan · 1 lot · LIMIT below market, so it should rest unfilled</span></h3>
+<p class="muted" style="margin:0 0 8px">Checks the order API end to end (token, static IP whitelist, placement, order book, cancel). Pick CE or PE, how many strikes out of the money and how many rupees below the last price. It places a LIMIT BUY of 1 lot (INTRADAY, DAY). When it shows PENDING in the table, press <b>Cancel</b>: nothing is bought. If the market dips and it fills, <b>Square off</b> sells it at market. Market hours only.</p>
+<div class="row"><label class="f">Leg<select id="moleg"><option>CE</option><option>PE</option></select></label><label class="f">Strikes OTM<input id="mootm" type="number" min="1" max="10" value="2" style="width:90px"></label><label class="f">₹ below LTP<input id="mobelow" type="number" min="1" max="50" value="12" style="width:90px"></label><button class="btn ghost" style="align-self:flex-end" onclick="moQuote()">Quote</button><input id="moconfirm" placeholder="type ORDER to confirm" style="width:200px;align-self:flex-end"><button class="btn danger" style="align-self:flex-end" onclick="moPlace()">Place LIMIT BUY</button><button class="btn ghost sm" style="align-self:flex-end" onclick="moOrders()">Refresh orders</button></div>
+<div id="moquote" class="muted" style="font-size:12px;margin:4px 0 8px">Press Quote to see the contract and the limit price before placing anything.</div>
+<div id="moorders"><span class="muted">—</span></div></div>
 <div class="help"><b>Paper trading places no orders.</b> It polls Dhan every minute, applies the two brains, and books simulated fills at the option price ± ₹0.50 with brokerage, STT and exchange charges. Start it before 09:15 and leave it until 15:30; it closes everything by 15:15 and writes a session report. Settings are fixed for the 15-session run: PIVOT 2 strikes in the money, cap ₹15,000; EXPIRY brain on from 2026-10-15 (first possible trade 2026-10-19).
 <ul><li><b>Stop</b> ends the process; any open paper position is simply dropped from the log, so stop only after 15:15 unless something is wrong.</li><li>Restarting during the day is safe: it reloads today's state and never re-enters an old signal.</li></ul></div>
 <div class="grid g3"><div class="card"><h3>Controls</h3><div id="papstat"></div>
@@ -485,8 +501,16 @@ el('papopen').innerHTML=pp.state?`<table><tr><th>Brain</th><th>Entries</th><th>R
 el('paptrades').innerHTML=pp.trades.length?'<table><tr>'+['brain','entry_time','leg','strike','opt_entry','exit_time','exit_reason','opt_exit','index_move_pts','net_inr'].map(k=>'<th>'+k.replace(/_/g,' ')+'</th>').join('')+'</tr>'+pp.trades.map(t=>'<tr>'+['brain','entry_time','leg','strike','opt_entry','exit_time','exit_reason','opt_exit','index_move_pts','net_inr'].map(k=>`<td class="${k==='net_inr'?(parseFloat(t[k])>=0?'ok':'bad'):''}">${esc(t[k])}</td>`).join('')+'</tr>').join('')+'</table>':'<span class="muted">none yet</span>';
 el('paplog').textContent=pp.log||'—';el('papsess').innerHTML=pp.sessions.slice().reverse().map(f=>`<button class="btn ghost sm" onclick="api('/api/file?name=${encodeURIComponent(f)}').then(t=>el('papview').textContent=t)">${esc(f.replace('SESSION_','').replace('.md',''))}</button> `).join('');
 el('jobs_t').innerHTML='<table><tr><th>Job</th><th>PID</th><th>Status</th><th>CPU</th><th>RAM</th><th>Started</th><th>Command</th><th></th></tr>'+(dj.length?dj.map(j=>`<tr><td><b>${esc(j.name)}</b></td><td class="mono">${j.pid}</td><td>${j.running?'<span class="pill ok">running</span>':'<span class="pill muted">done rc '+j.rc+'</span>'}</td><td class="mono">${rp(j.pid).cpu}</td><td class="mono">${rp(j.pid).ram}</td><td>${esc(j.started)}</td><td class="mono"><small>${esc(j.args)}</small></td><td><button class="btn ghost sm" onclick="api('/api/log?name=${encodeURIComponent(j.log)}').then(d=>el('joblog').textContent=d.text||'—')">Log</button> ${j.running?`<button class="btn danger sm" onclick="confirmThen('Kill job ${esc(j.name)}?','The process is terminated immediately.',()=>api('/api/job/kill?name=${esc(j.name)}').then(()=>{toast('Killed','warn');refreshAll()}))">Kill</button>`:''}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no jobs this session</td></tr>')+'</table>';
-el('clock').textContent='updated '+new Date().toLocaleTimeString();if(el('paper').classList.contains('on'))loadChart()}
+el('clock').textContent='updated '+new Date().toLocaleTimeString();if(el('paper').classList.contains('on')){loadChart();if(window._moUsed)moOrders()}}
 let TF=1;function setTf(t){TF=t;loadChart()}
+function moArgs(){return {leg:v('moleg'),otm:v('mootm'),below:v('mobelow')}}
+function moFmt(d){if(d.error)return '<span class="bad">'+esc(d.error)+'</span>';return `NIFTY ${esc(d.expiry)} <b>${d.strike} ${esc(d.leg)}</b> · spot ${d.spot} · ATM ${d.atm} · LTP ₹${d.ltp} · limit <b>₹${d.limit}</b> × ${d.lot} = ₹${d.cost.toLocaleString('en-IN')} if filled · security ${esc(String(d.sid))}${d.warning?' · <span class="warn">'+esc(d.warning)+'</span>':''}`}
+function moQuote(){window._moUsed=true;el('moquote').textContent='quoting…';post('/api/manual/quote',moArgs()).then(d=>el('moquote').innerHTML=moFmt(d))}
+function moPlace(){if(v('moconfirm')!=='ORDER'){toast('Type ORDER in the box to confirm','warn');return}window._moUsed=true;toast('Quoting…','',2000);post('/api/manual/quote',moArgs()).then(q=>{if(q.error){toast('Quote failed: '+q.error,'bad',6000);el('moquote').innerHTML=moFmt(q);return}el('moquote').innerHTML=moFmt(q);
+confirmThen('Place a REAL limit order on Dhan?',`BUY 1 lot (${q.lot}) NIFTY ${q.expiry} ${q.strike} ${q.leg} · LIMIT ₹${q.limit} (LTP ₹${q.ltp}, ₹${moArgs().below} below) · up to ₹${q.cost.toLocaleString('en-IN')} if it fills. Cancel it from the orders table afterwards.`,()=>{toast('Placing order…','',4000);post('/api/manual/place',moArgs()).then(d=>{el('moconfirm').value='';if(d.error){toast('Order failed: '+d.error,'bad',10000)}else{toast('Order '+d.order_id+' · '+d.status+(d.error?' · '+d.error:''),d.error?'warn':'ok',8000)}moOrders()})})})}
+function moOrders(){window._moUsed=true;api('/api/manual/orders').then(d=>{if(d.error){el('moorders').innerHTML='<span class="bad">'+esc(d.error)+'</span>';return}const o=d.orders||[];el('moorders').innerHTML=o.length?'<table><tr><th>Time</th><th>Order</th><th>Contract</th><th>Side</th><th>Type</th><th>Filled/qty</th><th>Price</th><th>Status</th><th></th></tr>'+o.map(x=>`<tr><td class="mono">${esc(x.time)}</td><td class="mono"><small>${esc(x.order_id)}</small></td><td><b>${esc(String(x.symbol))}</b></td><td>${esc(x.side)}</td><td>${esc(x.type)}</td><td>${x.filled}/${x.qty}</td><td>₹${x.price}${x.avg?' → ₹'+x.avg:''}</td><td><span class="pill ${x.status==='TRADED'?'ok':/PENDING|TRANSIT/.test(x.status)?'warn':'muted'}">${esc(x.status)}</span>${x.error?'<br><small class="bad">'+esc(x.error)+'</small>':''}</td><td>${/PENDING|TRANSIT/.test(x.status)?`<button class="btn sm" onclick="moCancel('${esc(x.order_id)}')">Cancel</button>`:''} ${(x.status==='TRADED'&&x.side==='BUY')?`<button class="btn danger sm" onclick="moSquare('${esc(x.order_id)}')">Square off</button>`:''}</td></tr>`).join('')+'</table>':'<span class="muted">no orders today</span>'})}
+function moCancel(id){confirmThen('Cancel order '+id+'?','The pending limit order is withdrawn from Dhan.',()=>post('/api/manual/cancel',{order_id:id}).then(d=>{toast(d.error?'Cancel failed: '+d.error:'Order '+d.status,d.error?'bad':'ok',6000);moOrders()}))}
+function moSquare(id){confirmThen('Square off order '+id+'?','MARKET SELL of the filled quantity. Real order.',()=>post('/api/manual/squareoff',{order_id:id}).then(d=>{toast(d.error?'Square off failed: '+d.error:'Sold '+d.qty+' @ ₹'+d.price+' (gross ₹'+d.gross+')',d.error?'bad':'ok',8000);moOrders()}))}
 function mb(x){return x>=1024?(x/1024).toFixed(2)+' GB':Math.round(x)+' MB'}
 function drawRes(r){const tiles=el('rtiles');if(!tiles)return;if(!r||r.error){tiles.innerHTML=`<span class="muted">resource sampling unavailable${r&&r.error?': '+esc(r.error):''}</span>`;return}
 const memPct=r.mem_total_mb?r.mem_used_mb/r.mem_total_mb*100:0,algoMem=r.mem_total_mb?r.algo_rss_mb/r.mem_total_mb*100:0,cls=p=>p>=90?'bad':p>=70?'warn':'';
@@ -576,6 +600,8 @@ class H(BaseHTTPRequestHandler):
             rc, out = run_capture([PY, "tools/dhan_token.py", "install-launchd", "--then-update"], 30); return self._json({"rc": rc, "out": out})
         if p == "/api/telegram/test":
             rc, out = run_capture([PY, "tools/paper_trade.py", "--telegram-test"], 30); return self._json({"rc": rc, "out": out})
+        if p == "/api/manual/orders":
+            return self._json(manual_order("orders", timeout=40))
         if p == "/api/telegram/test_channel":
             rc, out = run_capture([PY, "tools/paper_trade.py", "--telegram-test-channel"], 30); return self._json({"rc": rc, "out": out})
         if p == "/api/journal/rebuild":
@@ -609,6 +635,16 @@ class H(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path; b = self._body()
         if p in ("/api/paper/stop",):
             return self.do_GET()
+        if p in ("/api/manual/quote", "/api/manual/place"):
+            try:
+                leg = str(b.get("leg", "CE")).upper(); otm = int(b.get("otm", 2)); below = float(b.get("below", 12))
+            except Exception:
+                return self._json({"error": "bad leg / otm / below"})
+            return self._json(manual_order("place" if p.endswith("place") else "quote", "--leg", leg, "--otm", otm, "--below", below))
+        if p == "/api/manual/cancel":
+            return self._json(manual_order("cancel", "--order-id", str(b.get("order_id", ""))))
+        if p == "/api/manual/squareoff":
+            return self._json(manual_order("squareoff", "--order-id", str(b.get("order_id", ""))))
         if p == "/api/live/start":
             if b.get("confirm") != "LIVE":
                 return self._json({"error": "type LIVE to confirm"}, 400)
