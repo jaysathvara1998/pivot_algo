@@ -1090,7 +1090,7 @@ def main():
                 P.say(f"snapshot write failed: {str(e)[:80]}")
             P.process(bars, atm, len(bars) - 1); tw = session_twap(bars)
             if a.feed and last_done == bars[-1].timestamp:
-                continue
+                time.sleep(5); continue                                    # same bar as last pass: re-check the open position every 5 s, do not spin (this `continue` used to skip the sleep below → 100% CPU)
             last_done = bars[-1].timestamp
             opens = "; ".join(f"{b.name}: {st['open']['leg']} {int(st['open']['strike'])} @ {st['open']['p_in']:.2f} last {st['open'].get('last_px')}" for b in brains for st in [P.state['brains'][b.name]] if st["open"]) or "none"
             P.say(f"bar {bars[-1].timestamp.strftime('%H:%M')} index {bars[-1].close:.1f} VWAP {tw[-1]:.1f} · open: {opens} · equity ₹{P.state['equity']:,.0f}")
